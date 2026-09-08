@@ -220,12 +220,14 @@ dialect = "cmd"
 }
 
 #[test]
-fn shell_config_default_environment_is_inherited() {
+fn shell_config_default_environment_blocks_unlisted_parent_values() {
     let _guard = test_env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
-    let _env = EnvGuard::new().set("WEBCODEX_INHERITED_TEST", "inherited-ok");
+    let _env = EnvGuard::new()
+        .set("WEBCODEX_INHERITED_TEST", "inherited-ok")
+        .remove("WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST");
     let result = run_shell(
         &cfg.policy,
         &ShellConfig::default(),
@@ -236,7 +238,32 @@ fn shell_config_default_environment_is_inherited() {
         None,
     );
     assert_eq!(result.exit_code, Some(0), "{result:?}");
-    assert_eq!(result.stdout.as_deref(), Some("inherited-ok"));
+    assert_eq!(result.stdout.as_deref(), Some(""), "{result:?}");
+}
+
+#[test]
+fn shell_config_parent_environment_requires_explicit_allowlist() {
+    let _guard = test_env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(tmp.path().join("config/project-registry"));
+    let cwd = tmp.path().to_string_lossy().to_string();
+    let _env = EnvGuard::new()
+        .set("WEBCODEX_INHERITED_TEST", "inherited-ok")
+        .set(
+            "WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST",
+            "WEBCODEX_INHERITED_TEST",
+        );
+    let result = run_shell(
+        &cfg.policy,
+        &ShellConfig::default(),
+        Some(&cwd),
+        &shell_env_var("WEBCODEX_INHERITED_TEST"),
+        None,
+        10,
+        None,
+    );
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.as_deref(), Some("inherited-ok"), "{result:?}");
 }
 
 #[test]
