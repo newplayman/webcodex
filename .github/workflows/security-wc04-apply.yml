@@ -1,0 +1,261 @@
+name: Apply WC-04 shell environment hardening
+
+on:
+  push:
+    branches:
+      - security/harden-6b37efc
+
+permissions:
+  contents: write
+
+jobs:
+  apply-wc04:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: security/harden-6b37efc
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply WC-04 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/webcodex-runner/src/webcodex_runner/shell.rs')
+          text = path.read_text()
+
+          old = '''fn should_inherit_env_key(key: &str) -> bool {
+    // Windows command processors may add drive-current-directory pseudo
+    // entries such as `=E:=E:\\\\git\\\\webcodex` to the native environment
+    // block. They are not ordinary environment variables and cannot be
+    // reconstructed through `Command::env`; detached execution carries its
+    // working directory explicitly, so dropping them preserves the intended
+    // child environment without weakening launch-envelope validation.
+    !is_sensitive_env_key(key) && !(cfg!(windows) && key.starts_with('='))
+}
+'''
+          new = '''fn should_inherit_env_key(key: &str) -> bool {
+    // Windows command processors may add drive-current-directory pseudo
+    // entries such as `=E:=E:\\\\git\\\\webcodex` to the native environment
+    // block. They are not ordinary environment variables and cannot be
+    // reconstructed through `Command::env`; detached execution carries its
+    // working directory explicitly, so dropping them preserves the intended
+    // child environment without weakening launch-envelope validation.
+    !is_sensitive_env_key(key) && !(cfg!(windows) && key.starts_with('='))
+}
+
+// WC-04: raw/plain Runner execution must not accidentally inherit every
+// credential present in the long-lived Runner service environment. Keep only
+// the minimum OS/session baseline by default. Projects that deliberately need
+// another parent variable can opt that exact name in through
+// WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST, or (preferably) provide the credential
+// through the existing explicit shell/profile env configuration.
+const PLAIN_SHELL_BASELINE_ENV_KEYS: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "COLORTERM",
+    "TMPDIR", "TMP", "TEMP", "TZ",
+];
+
+#[cfg(windows)]
+const PLAIN_SHELL_WINDOWS_BASELINE_ENV_KEYS: &[&str] = &[
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+];
+
+fn baseline_plain_shell_parent_env_key(key: &str) -> bool {
+    PLAIN_SHELL_BASELINE_ENV_KEYS
+        .iter()
+        .any(|allowed| env_keys_equal(allowed, key))
+        || key.starts_with("LC_")
+        || {
+            #[cfg(windows)]
+            {
+                PLAIN_SHELL_WINDOWS_BASELINE_ENV_KEYS
+                    .iter()
+                    .any(|allowed| env_keys_equal(allowed, key))
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+}
+
+fn env_allowlist_contains(raw: &str, key: &str) -> bool {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .any(|candidate| env_keys_equal(candidate, key))
+}
+
+fn operator_plain_shell_parent_env_key_allowed(key: &str) -> bool {
+    std::env::var("WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST")
+        .ok()
+        .is_some_and(|raw| env_allowlist_contains(&raw, key))
+}
+
+fn should_inherit_plain_shell_parent_env_key(key: &str) -> bool {
+    should_inherit_env_key(key)
+        && (baseline_plain_shell_parent_env_key(key)
+            || operator_plain_shell_parent_env_key_allowed(key))
+}
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one should_inherit_env_key block, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(), String> {
+    // Rust's Windows env handling is case-insensitive (like the OS itself), so
+    // removing the canonical spellings also removes mixed-case variants such
+    // as `WebCodex_Token`.
+    for key in SENSITIVE_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+    if !shell.path_prepend.is_empty() {
+        let mut paths = shell.path_prepend.clone();
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        let joined = std::env::join_paths(paths)
+            .map_err(|e| format!("failed to build shell PATH from shell.path_prepend: {}", e))?;
+        cmd.env("PATH", joined);
+    }
+    for (key, value) in &shell.env {
+        if !is_sensitive_env_key(key) {
+            cmd.env(key, value);
+        }
+    }
+    Ok(())
+}
+'''
+          new = '''fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(), String> {
+    let inherited = std::env::vars_os()
+        .filter(|(key, _)| {
+            key.to_str()
+                .is_some_and(should_inherit_plain_shell_parent_env_key)
+        })
+        .collect::<Vec<_>>();
+    let inherited_path = inherited
+        .iter()
+        .find(|(key, _)| {
+            key.to_str()
+                .is_some_and(|key| env_keys_equal(key, "PATH"))
+        })
+        .map(|(_, value)| value.clone());
+
+    // Fail closed against ambient credentials: Command inherits its parent's
+    // complete environment unless explicitly cleared. Start from the bounded
+    // baseline above, then layer intentional Runner configuration on top.
+    cmd.env_clear();
+    for (key, value) in inherited {
+        cmd.env(key, value);
+    }
+    if !shell.path_prepend.is_empty() {
+        let mut paths = shell.path_prepend.clone();
+        if let Some(current) = inherited_path.as_deref() {
+            paths.extend(std::env::split_paths(current));
+        }
+        let joined = std::env::join_paths(paths)
+            .map_err(|e| format!("failed to build shell PATH from shell.path_prepend: {}", e))?;
+        cmd.env("PATH", joined);
+    }
+    // Explicit operator/project configuration remains authoritative. This is
+    // the supported path for a project that genuinely needs an exchange key,
+    // RPC credential, wallet signer endpoint, CUDA knob, proxy, etc. WebCodex's
+    // own transport/admin credentials remain non-injectable.
+    for (key, value) in &shell.env {
+        if !is_sensitive_env_key(key) {
+            cmd.env(key, value);
+        }
+    }
+    Ok(())
+}
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one apply_shell_environment block, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''    let mut env: HashMap<String, String> = std::env::vars()
+        .filter(|(key, _)| should_inherit_env_key(key))
+        .collect();
+'''
+          new = '''    let mut env: HashMap<String, String> = std::env::vars()
+        .filter(|(key, _)| should_inherit_plain_shell_parent_env_key(key))
+        .collect();
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one base_shell_env parent capture, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          # Append deterministic unit tests without mutating the process env.
+          text += r'''
+
+#[cfg(test)]
+mod security_hardening_parent_env_tests {
+    use super::*;
+
+    #[test]
+    fn plain_shell_parent_baseline_is_narrow() {
+        assert!(baseline_plain_shell_parent_env_key("PATH"));
+        assert!(baseline_plain_shell_parent_env_key("HOME"));
+        assert!(baseline_plain_shell_parent_env_key("LC_ALL"));
+        assert!(!baseline_plain_shell_parent_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!baseline_plain_shell_parent_env_key("PRIVATE_KEY"));
+        assert!(!baseline_plain_shell_parent_env_key("EXCHANGE_API_SECRET"));
+        assert!(!baseline_plain_shell_parent_env_key("SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn explicit_parent_allowlist_matches_exact_variable_names() {
+        let raw = "CUDA_VISIBLE_DEVICES, LD_LIBRARY_PATH,SSH_AUTH_SOCK";
+        assert!(env_allowlist_contains(raw, "CUDA_VISIBLE_DEVICES"));
+        assert!(env_allowlist_contains(raw, "LD_LIBRARY_PATH"));
+        assert!(env_allowlist_contains(raw, "SSH_AUTH_SOCK"));
+        assert!(!env_allowlist_contains(raw, "AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn webcodex_transport_secrets_remain_non_inheritable() {
+        assert!(!should_inherit_env_key("WEBCODEX_TOKEN"));
+        assert!(!should_inherit_env_key("WEBCODEX_AGENT_TOKEN"));
+        assert!(!should_inherit_env_key("AUTHORIZATION"));
+    }
+}
+'''
+          path.write_text(text)
+          PY
+
+      - name: Format and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo test --locked -p webcodex-runner
+          cargo check --locked --workspace --all-targets
+          cargo fmt --all -- --check
+
+      - name: Commit WC-04 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "webcodex-security-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/webcodex-runner/src/webcodex_runner/shell.rs
+          git commit -m "security: prevent ambient shell credential inheritance"
+          git push origin HEAD:security/harden-6b37efc
