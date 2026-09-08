@@ -2924,7 +2924,9 @@ mod security_hardening_parent_env_tests {
         assert!(baseline_plain_shell_parent_env_key("PATH"));
         assert!(baseline_plain_shell_parent_env_key("HOME"));
         assert!(baseline_plain_shell_parent_env_key("LC_ALL"));
-        assert!(!baseline_plain_shell_parent_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!baseline_plain_shell_parent_env_key(
+            "AWS_SECRET_ACCESS_KEY"
+        ));
         assert!(!baseline_plain_shell_parent_env_key("PRIVATE_KEY"));
         assert!(!baseline_plain_shell_parent_env_key("EXCHANGE_API_SECRET"));
         assert!(!baseline_plain_shell_parent_env_key("SSH_AUTH_SOCK"));
