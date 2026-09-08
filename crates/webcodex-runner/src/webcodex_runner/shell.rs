@@ -121,14 +121,81 @@ pub(crate) fn is_sensitive_env_key(key: &str) -> bool {
         .any(|sensitive| env_keys_equal(sensitive, key))
 }
 
-fn should_inherit_env_key(key: &str) -> bool {
-    // Windows command processors may add drive-current-directory pseudo
-    // entries such as `=E:=E:\\git\\webcodex` to the native environment
-    // block. They are not ordinary environment variables and cannot be
-    // reconstructed through `Command::env`; detached execution carries its
-    // working directory explicitly, so dropping them preserves the intended
-    // child environment without weakening launch-envelope validation.
+fn should_capture_env_key(key: &str) -> bool {
     !is_sensitive_env_key(key) && !(cfg!(windows) && key.starts_with('='))
+}
+
+// WC-04: a raw/plain execution must not accidentally inherit all credentials
+// from the long-lived Runner service process. Keep only the small OS/session
+// baseline by default. Operators may deliberately opt additional parent
+// variables in by exact name with WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST; project
+// shell/profile `env` configuration is the preferred explicit injection path.
+const PLAIN_SHELL_BASELINE_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "COLORTERM",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "TZ",
+];
+
+#[cfg(windows)]
+const PLAIN_SHELL_WINDOWS_BASELINE_ENV_KEYS: &[&str] = &[
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+];
+
+fn baseline_plain_shell_parent_env_key(key: &str) -> bool {
+    PLAIN_SHELL_BASELINE_ENV_KEYS
+        .iter()
+        .any(|allowed| env_keys_equal(allowed, key))
+        || key.starts_with("LC_")
+        || {
+            #[cfg(windows)]
+            {
+                PLAIN_SHELL_WINDOWS_BASELINE_ENV_KEYS
+                    .iter()
+                    .any(|allowed| env_keys_equal(allowed, key))
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+}
+
+fn env_allowlist_contains(raw: &str, key: &str) -> bool {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .any(|candidate| env_keys_equal(candidate, key))
+}
+
+fn operator_plain_shell_parent_env_key_allowed(key: &str) -> bool {
+    std::env::var("WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST")
+        .ok()
+        .is_some_and(|raw| env_allowlist_contains(&raw, key))
+}
+
+fn should_inherit_env_key(key: &str) -> bool {
+    should_capture_env_key(key)
+        && (baseline_plain_shell_parent_env_key(key)
+            || operator_plain_shell_parent_env_key_allowed(key))
 }
 
 /// Case-insensitive lookup on Windows (where environment names are
@@ -240,11 +307,14 @@ fn prepared_shell_command_text(dialect: ShellDialect, command: &str) -> String {
 }
 
 fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(), String> {
-    // Rust's Windows env handling is case-insensitive (like the OS itself), so
-    // removing the canonical spellings also removes mixed-case variants such
-    // as `WebCodex_Token`.
-    for key in SENSITIVE_ENV_KEYS {
-        cmd.env_remove(key);
+    // Command inherits the Runner service environment by default. Remove every
+    // ambient variable that is not in the bounded OS/session baseline (or an
+    // operator's explicit allowlist) before layering project configuration.
+    for (key, _) in std::env::vars_os() {
+        let allowed = key.to_str().is_some_and(should_inherit_env_key);
+        if !allowed {
+            cmd.env_remove(&key);
+        }
     }
     if !shell.path_prepend.is_empty() {
         let mut paths = shell.path_prepend.clone();
@@ -255,6 +325,9 @@ fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(),
             .map_err(|e| format!("failed to build shell PATH from shell.path_prepend: {}", e))?;
         cmd.env("PATH", joined);
     }
+    // Explicit Runner/project configuration remains authoritative. A project
+    // can deliberately receive exchange/RPC/wallet credentials here; WebCodex
+    // transport/admin credentials remain non-injectable.
     for (key, value) in &shell.env {
         if !is_sensitive_env_key(key) {
             cmd.env(key, value);
@@ -954,7 +1027,11 @@ fn parse_env_payload(
                 profile_name
             )
         })?;
-        if should_inherit_env_key(key) {
+        // The initial parent environment is narrow, but a project's init
+        // script may create ordinary variables such as VIRTUAL_ENV. Only
+        // WebCodex transport/admin keys and Windows pseudo entries are removed
+        // from the prepared snapshot.
+        if should_capture_env_key(key) {
             env.insert(key.to_string(), value.to_string());
         }
     }
@@ -1444,8 +1521,8 @@ fn terminate_child_process_tree(child: &mut ManagedChild) -> Result<(), String> 
 ///    ([`PROCESS_GROUP_TERMINATION_GRACE`]) to exit on its own; on Windows the
 ///    request reports `Unsupported` and the next phase escalates immediately.
 /// 2. Force phase: `terminate_tree` for anything still alive.
-/// 3. Whole-tree exit confirmation: `wait_tree_exit`, not just the direct
-///    child (a direct-child exit never proves the tree is gone).
+/// 3. Whole-tree exit confirmation: `wait_tree_exit`, not just the direct child
+///    (a direct-child exit never proves the tree is gone).
 /// 4. Direct-child reap within the remaining budget.
 fn terminate_child_process_tree_until(
     child: &mut ManagedChild,
@@ -2836,6 +2913,39 @@ fn spawned_output_failure(start: Instant, error: String) -> ShellCommandResult {
         duration_ms: Some(start.elapsed().as_millis() as u64),
         error: Some(error),
     })
+}
+
+#[cfg(test)]
+mod security_hardening_parent_env_tests {
+    use super::*;
+
+    #[test]
+    fn plain_shell_parent_baseline_is_narrow() {
+        assert!(baseline_plain_shell_parent_env_key("PATH"));
+        assert!(baseline_plain_shell_parent_env_key("HOME"));
+        assert!(baseline_plain_shell_parent_env_key("LC_ALL"));
+        assert!(!baseline_plain_shell_parent_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!baseline_plain_shell_parent_env_key("PRIVATE_KEY"));
+        assert!(!baseline_plain_shell_parent_env_key("EXCHANGE_API_SECRET"));
+        assert!(!baseline_plain_shell_parent_env_key("SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn explicit_parent_allowlist_is_exact() {
+        let raw = "CUDA_VISIBLE_DEVICES, LD_LIBRARY_PATH,SSH_AUTH_SOCK";
+        assert!(env_allowlist_contains(raw, "CUDA_VISIBLE_DEVICES"));
+        assert!(env_allowlist_contains(raw, "LD_LIBRARY_PATH"));
+        assert!(env_allowlist_contains(raw, "SSH_AUTH_SOCK"));
+        assert!(!env_allowlist_contains(raw, "AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn webcodex_transport_secrets_never_pass_capture_filter() {
+        assert!(!should_capture_env_key("WEBCODEX_TOKEN"));
+        assert!(!should_capture_env_key("WEBCODEX_AGENT_TOKEN"));
+        assert!(!should_capture_env_key("WEBCODEX_USER_TOKEN"));
+        assert!(!should_capture_env_key("AUTHORIZATION"));
+    }
 }
 
 #[cfg(test)]
