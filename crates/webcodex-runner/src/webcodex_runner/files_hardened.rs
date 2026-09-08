@@ -126,7 +126,10 @@ mod tests {
         symlink("normal.txt", root.join("settings.txt")).expect("symlink");
         let result = canonical_secret_checked_target(&root, &root.join("settings.txt"))
             .expect("normal alias should resolve");
-        assert_eq!(result, root.join("normal.txt").canonicalize().expect("canonical"));
+        assert_eq!(
+            result,
+            root.join("normal.txt").canonicalize().expect("canonical")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
