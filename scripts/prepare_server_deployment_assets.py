@@ -12,7 +12,13 @@ from pathlib import Path
 SERVER_IMAGE = "ghcr.io/yyjeqhc/webcodex-server"
 BOOTSTRAP_ASSET = "webcodex-server-bootstrap.sh"
 MATERIALIZED_COMPOSE = "webcodex-server-compose.yaml"
-DEFAULT_IMAGE_MARKER = f"image: ${{WEBCODEX_SERVER_IMAGE:-{SERVER_IMAGE}:latest}}"
+# The audited fork deliberately uses a local, non-pullable default in source
+# Compose so merely running `docker compose up` cannot drift to upstream
+# `latest`. Release publication is a separate, reviewed path: this exact marker
+# is replaced with one immutable GHCR digest below.
+DEFAULT_IMAGE_MARKER = "image: ${WEBCODEX_SERVER_IMAGE:-webcodex-server-local:security-hardened}"
+DEFAULT_PULL_POLICY_MARKER = "pull_policy: never"
+RELEASE_PULL_POLICY = "pull_policy: always"
 HEREDOC_MARKER = "__WEBCODEX_RELEASE_COMPOSE_EOF__"
 MAX_SOURCE_BYTES = 256 * 1024
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -36,6 +42,8 @@ def render_bootstrap(*, compose: str, bootstrap: str, digest: str) -> str:
         raise ValueError(f"invalid server image digest: {digest!r}")
     if compose.count(DEFAULT_IMAGE_MARKER) != 1:
         raise ValueError("canonical compose image marker is missing or duplicated")
+    if compose.count(DEFAULT_PULL_POLICY_MARKER) != 1:
+        raise ValueError("canonical compose pull-policy marker is missing or duplicated")
     if "\n    build:\n" in compose or "webcodex-runner" in compose:
         raise ValueError("canonical server compose unexpectedly contains build or Runner content")
     if HEREDOC_MARKER in compose:
@@ -43,6 +51,9 @@ def render_bootstrap(*, compose: str, bootstrap: str, digest: str) -> str:
 
     pinned = f"image: ${{WEBCODEX_SERVER_IMAGE:-{SERVER_IMAGE}@{digest}}}"
     compose = compose.replace(DEFAULT_IMAGE_MARKER, pinned, 1)
+    # The generated release asset is already pinned by digest, so it may pull
+    # that immutable object when absent. Keep source Compose itself fail-closed.
+    compose = compose.replace(DEFAULT_PULL_POLICY_MARKER, RELEASE_PULL_POLICY, 1)
 
     required_bootstrap_markers = (
         "COMPOSE_FILE",
