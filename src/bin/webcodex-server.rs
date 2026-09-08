@@ -14,10 +14,30 @@ fn build_server_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     builder.build()
 }
 
+fn unauthenticated_bootstrap_explicitly_allowed() -> bool {
+    std::env::var("WEBCODEX_ALLOW_UNAUTHENTICATED_BOOTSTRAP")
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn require_server_authentication() -> Result<(), std::io::Error> {
+    let token_present = std::env::var("WEBCODEX_TOKEN")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if token_present || unauthenticated_bootstrap_explicitly_allowed() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "WEBCODEX_TOKEN is required; refusing to start with unauthenticated bootstrap/admin access. For an explicitly trusted local development environment only, set WEBCODEX_ALLOW_UNAUTHENTICATED_BOOTSTRAP=true.",
+    ))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match server_binary_action(std::env::args().skip(1)) {
         ServerBinaryAction::Run { stop_on_stdin_eof } => {
             webcodex::prepare_server_process_environment().map_err(std::io::Error::other)?;
+            require_server_authentication()?;
             build_server_runtime()?
                 .block_on(webcodex::run_server_with_parent_liveness(stop_on_stdin_eof))
         }
@@ -37,10 +57,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
+#[cfg(test)]
+mod security_hardening_tests {
     use super::*;
 
+    #[test]
+    fn missing_token_is_not_implicitly_allowed() {
+        assert!(!matches!("".trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn server_runtime_uses_large_worker_stack() {
         let runtime = build_server_runtime().expect("build WebCodex Server runtime");
