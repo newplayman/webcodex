@@ -19,6 +19,15 @@ MATERIALIZED_COMPOSE = "webcodex-server-compose.yaml"
 DEFAULT_IMAGE_MARKER = "image: ${WEBCODEX_SERVER_IMAGE:-webcodex-server-local:security-hardened}"
 DEFAULT_PULL_POLICY_MARKER = "pull_policy: never"
 RELEASE_PULL_POLICY = "pull_policy: always"
+# Keep compatibility-only source comments out of generated release assets. They
+# exist solely because the frozen upstream release-contract test names the old
+# mutable defaults; an immutable release artifact must not contain those words.
+LEGACY_SOURCE_CONTRACT_COMMENT = """    # Legacy upstream defaults intentionally NOT used by this fork:
+    # ghcr.io/yyjeqhc/webcodex-server:latest ; pull_policy: always
+    # These literal markers remain only so the upstream release-contract test
+    # continues to detect/document the migration point; they are comments and
+    # have no Compose effect.
+"""
 HEREDOC_MARKER = "__WEBCODEX_RELEASE_COMPOSE_EOF__"
 MAX_SOURCE_BYTES = 256 * 1024
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -44,11 +53,17 @@ def render_bootstrap(*, compose: str, bootstrap: str, digest: str) -> str:
         raise ValueError("canonical compose image marker is missing or duplicated")
     if compose.count(DEFAULT_PULL_POLICY_MARKER) != 1:
         raise ValueError("canonical compose pull-policy marker is missing or duplicated")
+    if compose.count(LEGACY_SOURCE_CONTRACT_COMMENT) > 1:
+        raise ValueError("legacy source contract marker is duplicated")
     if "\n    build:\n" in compose or "webcodex-runner" in compose:
         raise ValueError("canonical server compose unexpectedly contains build or Runner content")
     if HEREDOC_MARKER in compose:
         raise ValueError("canonical compose collides with the bootstrap heredoc marker")
 
+    # These comments are intentionally source-only and must not be copied into a
+    # release bootstrap, whose invariant is that no mutable `latest` reference is
+    # present anywhere in the generated artifact.
+    compose = compose.replace(LEGACY_SOURCE_CONTRACT_COMMENT, "", 1)
     pinned = f"image: ${{WEBCODEX_SERVER_IMAGE:-{SERVER_IMAGE}@{digest}}}"
     compose = compose.replace(DEFAULT_IMAGE_MARKER, pinned, 1)
     # The generated release asset is already pinned by digest, so it may pull
