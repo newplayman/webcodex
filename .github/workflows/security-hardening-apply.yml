@@ -1,0 +1,474 @@
+name: Apply audited security hardening
+
+on:
+  push:
+    branches:
+      - security/harden-6b37efc
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: security/harden-6b37efc
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply security patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def read(path):
+              return Path(path).read_text()
+
+          def write(path, text):
+              Path(path).write_text(text)
+
+          def replace_once(path, old, new):
+              text = read(path)
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}")
+              write(path, text.replace(old, new, 1))
+
+          def regex_once(path, pattern, replacement):
+              text = read(path)
+              new, count = re.subn(pattern, replacement, text, count=1, flags=re.S | re.M)
+              if count != 1:
+                  raise SystemExit(f"{path}: regex expected exactly one match, found {count}")
+              write(path, new)
+
+          # WC-01: fail closed when the bootstrap/admin token is missing.
+          lib = "src/lib.rs"
+          replace_once(
+              lib,
+              "pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {\n",
+              "fn server_auth_start_allowed(auth_enabled: bool, explicit_unsafe_override: bool) -> bool {\n"
+              "    auth_enabled || explicit_unsafe_override\n"
+              "}\n\n"
+              "pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {\n",
+          )
+          replace_once(
+              lib,
+              "    let config = Config::from_env();\n"
+              "    let (acceptor, listener_mode, listener_addr) = server_listener::server_acceptor(&config.addr)\n"
+              "        .await\n"
+              "        .map_err(std::io::Error::other)?;\n",
+              "    let config = Config::from_env();\n"
+              "    let allow_unauthenticated_bootstrap =\n"
+              "        config::env_flag(\"WEBCODEX_ALLOW_UNAUTHENTICATED_BOOTSTRAP\").unwrap_or(false);\n"
+              "    if !server_auth_start_allowed(config.is_auth_enabled(), allow_unauthenticated_bootstrap) {\n"
+              "        return Err(std::io::Error::new(\n"
+              "            std::io::ErrorKind::PermissionDenied,\n"
+              "            \"WEBCODEX_TOKEN is required; refusing unauthenticated bootstrap access. Set WEBCODEX_ALLOW_UNAUTHENTICATED_BOOTSTRAP=true only for an explicitly trusted local development environment.\",\n"
+              "        )\n"
+              "        .into());\n"
+              "    }\n"
+              "    let (acceptor, listener_mode, listener_addr) = server_listener::server_acceptor(&config.addr)\n"
+              "        .await\n"
+              "        .map_err(std::io::Error::other)?;\n",
+          )
+          with Path(lib).open("a") as f:
+              f.write(r'''
+
+#[cfg(test)]
+mod security_hardening_auth_tests {
+    use super::server_auth_start_allowed;
+
+    #[test]
+    fn unauthenticated_bootstrap_requires_explicit_override() {
+        assert!(!server_auth_start_allowed(false, false));
+        assert!(server_auth_start_allowed(true, false));
+        assert!(server_auth_start_allowed(false, true));
+    }
+}
+''')
+
+          # WC-02: canonicalize the real read target, re-check the secret policy
+          # against that canonical project-relative target, and read the canonical
+          # path rather than the attacker-controlled symlink name.
+          files = "crates/webcodex-runner/src/webcodex_runner/files.rs"
+          regex_once(
+              files,
+              r"fn handle_file_read_request\(\n.*?\n\}\n\n#\[derive\(Serialize\)\]",
+              r'''fn handle_file_read_request(
+    policy: &RunnerPolicy,
+    request: &RunnerRequest,
+    resolved: &Path,
+    start: Instant,
+) -> CommandResult {
+    let target = match canonical_file_read_target_in_project(request, resolved) {
+        Ok(target) => target,
+        Err(reason) => {
+            return CommandResult {
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(read_file_reason_message(reason)),
+            }
+        }
+    };
+    // The transport cap (`max_bytes`) is clamped to the shared content budget so
+    // the runner never emits a range the server's model output limit cannot
+    // hold. The server always sends an explicit `start_line`/`end_line` for
+    // `read_file`, so this branch returns the canonical v1 envelope.
+    let max = request
+        .max_bytes
+        .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+        .min(policy.max_output_bytes);
+    if let (Some(start_line), Some(end_line)) = (request.start_line, request.end_line) {
+        return handle_file_read_range_request(&target, start_line, end_line, max, start);
+    }
+
+    // Legacy non-range path: read the whole canonical file under the transport
+    // cap. Reading the canonical target, rather than the original alias, closes
+    // the symlink-name swap that previously bypassed sensitive-path checks.
+    match std::fs::read(&target) {
+        Ok(bytes) => {
+            if bytes.len() > max {
+                CommandResult {
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some(format!(
+                        "file too large: {} bytes exceeds max_bytes {}",
+                        bytes.len(),
+                        max
+                    )),
+                }
+            } else {
+                CommandResult {
+                    exit_code: Some(0),
+                    stdout: Some(String::from_utf8_lossy(&bytes).to_string()),
+                    stderr: Some(String::new()),
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: None,
+                }
+            }
+        }
+        Err(e) => CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+            error: Some(file_read_error_message(&e)),
+        },
+    }
+}
+
+#[derive(Serialize)]''',
+          )
+          regex_once(
+              files,
+              r"fn ensure_file_read_target_in_project\(\n.*?^\}\n",
+              r'''fn canonical_file_read_target_in_project(
+    request: &RunnerRequest,
+    resolved: &Path,
+) -> Result<PathBuf, ReadFileReason> {
+    let project_root = request.cwd.as_deref().ok_or(ReadFileReason::InvalidPath)?;
+    let project_root = Path::new(project_root)
+        .canonicalize()
+        .map_err(|error| read_file_reason_from_io(&error))?;
+    let target = resolved
+        .canonicalize()
+        .map_err(|error| read_file_reason_from_io(&error))?;
+    if !target.starts_with(&project_root) {
+        return Err(ReadFileReason::InvalidPath);
+    }
+    let relative = target
+        .strip_prefix(&project_root)
+        .map_err(|_| ReadFileReason::InvalidPath)?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    if webcodex_core::sensitive_paths::is_secret_path(&relative) {
+        return Err(ReadFileReason::SensitivePath);
+    }
+    if !target.is_file() {
+        return Err(ReadFileReason::NotFile);
+    }
+    Ok(target)
+}
+''',
+          )
+          with Path(files).open("a") as f:
+              f.write(r'''
+
+#[cfg(all(test, unix))]
+mod security_hardening_file_read_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "webcodex-security-read-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn canonical_read_target_blocks_symlink_alias_to_secret_file() {
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".env"), b"FAKE_SECRET=not-real\n").unwrap();
+        std::fs::write(root.join("normal.txt"), b"ok\n").unwrap();
+        symlink(".env", root.join("settings.txt")).unwrap();
+        symlink("normal.txt", root.join("normal-link.txt")).unwrap();
+
+        let secret_alias = root.join("settings.txt");
+        let relative_secret = secret_alias.canonicalize().unwrap();
+        let relative_secret = relative_secret.strip_prefix(root.canonicalize().unwrap()).unwrap();
+        assert!(webcodex_core::sensitive_paths::is_secret_path(
+            &relative_secret.to_string_lossy()
+        ));
+
+        let normal = root.join("normal-link.txt").canonicalize().unwrap();
+        assert!(normal.ends_with("normal.txt"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+''')
+
+          # WC-04: plain/raw shell no longer inherits the entire Runner parent
+          # environment. Preserve a small non-secret OS baseline; additional
+          # variables can be deliberately opted in by name or supplied through
+          # the existing shell/profile env configuration.
+          shell = "crates/webcodex-runner/src/webcodex_runner/shell.rs"
+          regex_once(
+              shell,
+              r"fn apply_shell_environment\(cmd: &mut Command, shell: &ShellConfig\) -> Result<\(\), String> \{\n.*?^\}\n\nfn apply_env_snapshot",
+              r'''const PLAIN_SHELL_BASELINE_ENV_KEYS: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "TZ",
+];
+
+#[cfg(windows)]
+const PLAIN_SHELL_WINDOWS_ENV_KEYS: &[&str] = &[
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+];
+
+fn baseline_plain_shell_env_key(key: &str) -> bool {
+    PLAIN_SHELL_BASELINE_ENV_KEYS
+        .iter()
+        .any(|allowed| env_keys_equal(allowed, key))
+        || key.starts_with("LC_")
+        || {
+            #[cfg(windows)]
+            {
+                PLAIN_SHELL_WINDOWS_ENV_KEYS
+                    .iter()
+                    .any(|allowed| env_keys_equal(allowed, key))
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+}
+
+fn operator_plain_shell_env_key_allowed(key: &str) -> bool {
+    std::env::var("WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST")
+        .ok()
+        .is_some_and(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|candidate| !candidate.is_empty())
+                .any(|candidate| env_keys_equal(candidate, key))
+        })
+}
+
+fn plain_shell_env_key_allowed(key: &str) -> bool {
+    !is_sensitive_env_key(key)
+        && (baseline_plain_shell_env_key(key) || operator_plain_shell_env_key_allowed(key))
+}
+
+fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(), String> {
+    let inherited = std::env::vars_os()
+        .filter(|(key, _)| {
+            key.to_str()
+                .is_some_and(plain_shell_env_key_allowed)
+        })
+        .collect::<Vec<_>>();
+    let inherited_path = inherited
+        .iter()
+        .find(|(key, _)| key.to_str().is_some_and(|key| env_keys_equal(key, "PATH")))
+        .map(|(_, value)| value.clone());
+
+    // A raw shell previously inherited every parent variable except four
+    // WebCodex-specific names. Clear first so unrelated wallet/exchange/cloud
+    // credentials cannot leak into child processes merely because the Runner
+    // service happened to inherit them.
+    cmd.env_clear();
+    for (key, value) in inherited {
+        cmd.env(key, value);
+    }
+
+    if !shell.path_prepend.is_empty() {
+        let mut paths = shell.path_prepend.clone();
+        if let Some(current) = inherited_path.as_deref() {
+            paths.extend(std::env::split_paths(current));
+        }
+        let joined = std::env::join_paths(paths)
+            .map_err(|e| format!("failed to build shell PATH from shell.path_prepend: {}", e))?;
+        cmd.env("PATH", joined);
+    }
+    // Explicit operator configuration remains authoritative. This preserves
+    // full functionality for projects that deliberately need an API key or
+    // other variable while preventing accidental ambient inheritance.
+    for (key, value) in &shell.env {
+        if !is_sensitive_env_key(key) {
+            cmd.env(key, value);
+        }
+    }
+    Ok(())
+}
+
+fn apply_env_snapshot''',
+          )
+          with Path(shell).open("a") as f:
+              f.write(r'''
+
+#[cfg(test)]
+mod security_hardening_shell_env_tests {
+    use super::*;
+
+    #[test]
+    fn raw_shell_baseline_excludes_business_credentials() {
+        assert!(baseline_plain_shell_env_key("PATH"));
+        assert!(baseline_plain_shell_env_key("HOME"));
+        assert!(!baseline_plain_shell_env_key("PRIVATE_KEY"));
+        assert!(!baseline_plain_shell_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!baseline_plain_shell_env_key("EXCHANGE_API_SECRET"));
+        assert!(is_sensitive_env_key("WEBCODEX_TOKEN"));
+    }
+}
+''')
+
+          # WC-03: never silently pull the upstream mutable `latest` image.
+          compose = "compose.yaml"
+          replace_once(
+              compose,
+              "    image: ${WEBCODEX_SERVER_IMAGE:-ghcr.io/yyjeqhc/webcodex-server:latest}\n    pull_policy: always\n",
+              "    # Security-hardened fork: deployment must use a locally built or explicitly supplied audited image.\n"
+              "    # The default is intentionally local-only so upstream tag movement cannot change audited code.\n"
+              "    image: ${WEBCODEX_SERVER_IMAGE:-webcodex-server-local:security-hardened}\n"
+              "    pull_policy: never\n",
+          )
+          build_compose = "compose.build.yaml"
+          replace_once(
+              build_compose,
+              "    image: webcodex-server-local:${WEBCODEX_IMAGE_TAG:-latest}\n",
+              "    image: webcodex-server-local:${WEBCODEX_IMAGE_TAG:-security-hardened}\n",
+          )
+
+          env_example = ".env.compose.example"
+          text = read(env_example)
+          text += """
+
+# Security-hardened fork: compose.yaml never pulls an upstream mutable image.
+# Build this checkout explicitly with:
+#   docker compose -f compose.yaml -f compose.build.yaml build
+# The default local image name is webcodex-server-local:security-hardened.
+# To use another image, set WEBCODEX_SERVER_IMAGE to an audited immutable reference.
+#
+# Raw-shell parent environment inheritance is deny-by-default except for a small
+# OS baseline. Extra non-WebCodex variables may be explicitly inherited by name:
+# WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST=CUDA_VISIBLE_DEVICES,LD_LIBRARY_PATH
+"""
+          write(env_example, text)
+
+          Path("SECURITY_HARDENING.md").write_text(r'''# Security hardening for the audited fork
+
+This branch hardens the source snapshot rooted at upstream commit
+`6b37efc64b81a1e09a7a4d7b83f754f4860429b2` without removing file editing,
+Git, shell, Jobs, Python, or other normal WebCodex execution capabilities.
+
+## Security changes
+
+1. **Authentication fails closed.** A Server without `WEBCODEX_TOKEN` now refuses
+   to start. The old unauthenticated bootstrap/admin behavior is available only
+   through the explicit local-development escape hatch
+   `WEBCODEX_ALLOW_UNAUTHENTICATED_BOOTSTRAP=true`.
+2. **Canonical read targets are re-checked.** Runner file reads canonicalize the
+   actual target, verify it remains inside the registered project, re-apply the
+   sensitive-path policy to the canonical project-relative path, and then read
+   the canonical target. A harmless-looking symlink can no longer alias `.env`,
+   `*.key`, `*.pem`, Runner credentials, or other protected names.
+3. **Raw shell ambient secrets are not inherited.** Plain/raw shell execution
+   starts from a small OS environment baseline instead of inheriting the entire
+   Runner service environment. Extra variables can be deliberately inherited by
+   name using `WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST`, or supplied through the
+   existing per-project shell/profile `env` configuration. WebCodex's own
+   transport credentials remain non-inheritable.
+4. **Deployment does not follow upstream `latest`.** The default Compose file
+   uses a local-only hardened image with `pull_policy: never`. Build this exact
+   checkout using `compose.build.yaml`, or explicitly configure an audited image.
+
+## Credential-bearing projects
+
+The changes above prevent accidental ambient credential exposure. They do not
+pretend that arbitrary shell execution and unrestricted access to a credential
+are logically separable: if a project intentionally injects a private key into
+its execution environment, code authorized to run in that environment can use
+that key. Prefer narrowly scoped project-specific credentials and do not expose
+Server/Runner bootstrap credentials to project processes.
+
+`WEBCODEX_TOOL_REQUEST_TRACE=full` intentionally stores semantic tool payloads
+and may therefore retain secrets that appear in command output or tool results.
+Leave full tracing disabled during credential-bearing operation unless that
+retention is explicitly required and protected.
+''')
+          PY
+
+      - name: Format Rust
+        run: cargo fmt --all
+
+      - name: Run security regression tests
+        run: cargo test --locked --workspace security_hardening_ -- --nocapture
+
+      - name: Run core Server tests
+        run: cargo test --locked -p webcodex --lib
+
+      - name: Run Runner tests
+        run: cargo test --locked -p webcodex-runner
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Commit hardened source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/security-hardening-apply.yml
+          git config user.name "webcodex-security-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --stat
+          git commit -m "security: harden auth, file reads, shell env, and image pinning"
+          git push origin HEAD:security/harden-6b37efc
