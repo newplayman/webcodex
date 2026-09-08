@@ -8,10 +8,10 @@ pub(crate) mod dispatch;
 #[cfg(windows)]
 pub(crate) mod exit_diagnostics;
 pub(crate) mod external_tools;
-#[path = "files.rs"]
-pub(crate) mod files_impl;
 #[path = "files_hardened.rs"]
 pub(crate) mod files;
+#[path = "files.rs"]
+pub(crate) mod files_impl;
 pub(crate) mod lsp;
 pub(crate) mod managed_ssh;
 pub(crate) mod mcp_gateway;
