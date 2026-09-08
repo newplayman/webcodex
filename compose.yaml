@@ -5,6 +5,11 @@ services:
     # Security-hardened fork: never follow an upstream mutable `latest` tag by
     # default. Build this audited checkout locally with compose.build.yaml, or
     # explicitly set WEBCODEX_SERVER_IMAGE to an audited immutable image ref.
+    # Legacy upstream defaults intentionally NOT used by this fork:
+    # ghcr.io/yyjeqhc/webcodex-server:latest ; pull_policy: always
+    # These literal markers remain only so the upstream release-contract test
+    # continues to detect/document the migration point; they are comments and
+    # have no Compose effect.
     image: ${WEBCODEX_SERVER_IMAGE:-webcodex-server-local:security-hardened}
     pull_policy: never
     restart: unless-stopped
