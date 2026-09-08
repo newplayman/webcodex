@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use webcodex_workspace::file_read_range::ReadFileReason;
 
-#[cfg(test)]
 pub(crate) use files_impl::sha256_hex_bytes;
 pub(crate) use files_impl::{is_basic_file_request_kind, resolve_requested_path};
 
