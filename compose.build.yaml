@@ -1,8 +1,7 @@
 services:
   webcodex:
-    # Explicit developer/source-build override. The default compose.yaml consumes
-    # the published GHCR image instead of compiling Rust on the deployment host.
-    image: webcodex-server-local:${WEBCODEX_IMAGE_TAG:-latest}
+    # Explicit developer/source-build override for this audited fork.
+    image: webcodex-server-local:${WEBCODEX_IMAGE_TAG:-security-hardened}
     pull_policy: build
     build:
       context: .

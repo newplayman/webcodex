@@ -1,0 +1,12 @@
+# Security-hardened test/build environment.
+#
+# WC-04 makes raw Runner shells deny ambient parent variables by default. Native
+# Windows PowerShell needs a small set of non-secret OS/runtime variables for
+# module discovery and stable subprocess behavior. Cargo-launched test binaries
+# opt those exact names in so the cross-platform suite exercises the supported
+# explicit-allowlist path instead of reopening arbitrary parent inheritance.
+#
+# This does not embed values into WebCodex binaries. A deployed Windows Runner
+# service should explicitly set the same safe runtime names only when needed.
+[env]
+WEBCODEX_SHELL_INHERIT_ENV_ALLOWLIST = { value = "PSModulePath,ProgramFiles,ProgramFiles(x86),ProgramW6432,CommonProgramFiles,CommonProgramFiles(x86),CommonProgramW6432,ALLUSERSPROFILE,PUBLIC,USERNAME,USERDOMAIN,COMPUTERNAME,SESSIONNAME,OS,NUMBER_OF_PROCESSORS,PROCESSOR_ARCHITECTURE,PROCESSOR_IDENTIFIER,PROCESSOR_LEVEL,PROCESSOR_REVISION,WEBCODEX_UNICODE_ENV", force = false }
