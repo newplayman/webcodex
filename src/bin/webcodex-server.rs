@@ -15,9 +15,12 @@ fn build_server_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn require_server_authentication() -> Result<(), std::io::Error> {
