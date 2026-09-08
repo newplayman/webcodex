@@ -15,11 +15,10 @@ fn read_file_reason_message(reason: ReadFileReason) -> String {
 }
 
 fn canonical_secret_checked_target(
-    request: &RunnerRequest,
+    project_root: &Path,
     resolved: &Path,
 ) -> Result<PathBuf, ReadFileReason> {
-    let project_root = request.cwd.as_deref().ok_or(ReadFileReason::InvalidPath)?;
-    let project_root = Path::new(project_root)
+    let project_root = project_root
         .canonicalize()
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => ReadFileReason::NotFound,
@@ -61,7 +60,17 @@ pub(crate) fn handle_basic_file_request(
         return files_impl::handle_basic_file_request(policy, request, resolved, start);
     }
 
-    let canonical = match canonical_secret_checked_target(request, resolved) {
+    let Some(project_root) = request.cwd.as_deref() else {
+        return CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+            error: Some(read_file_reason_message(ReadFileReason::InvalidPath)),
+        };
+    };
+
+    let canonical = match canonical_secret_checked_target(Path::new(project_root), resolved) {
         Ok(path) => path,
         Err(reason) => {
             return CommandResult {
@@ -98,28 +107,13 @@ mod tests {
         ))
     }
 
-    fn request_for(root: &Path) -> RunnerRequest {
-        let mut request: RunnerRequest = serde_json::from_value(serde_json::json!({
-            "kind": "file_read",
-            "request_id": "security-test",
-            "cwd": root.to_string_lossy(),
-            "path": "settings.txt",
-            "timeout_secs": 5,
-            "command": ""
-        }))
-        .expect("construct RunnerRequest");
-        request.cwd = Some(root.to_string_lossy().into_owned());
-        request
-    }
-
     #[test]
     fn symlink_alias_to_dotenv_is_rejected() {
         let root = temp_root();
         std::fs::create_dir_all(&root).expect("mkdir");
         std::fs::write(root.join(".env"), b"FAKE_SECRET=not-real\n").expect("write secret");
         symlink(".env", root.join("settings.txt")).expect("symlink");
-        let request = request_for(&root);
-        let result = canonical_secret_checked_target(&request, &root.join("settings.txt"));
+        let result = canonical_secret_checked_target(&root, &root.join("settings.txt"));
         assert!(matches!(result, Err(ReadFileReason::SensitivePath)));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -130,8 +124,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir");
         std::fs::write(root.join("normal.txt"), b"ok\n").expect("write normal");
         symlink("normal.txt", root.join("settings.txt")).expect("symlink");
-        let request = request_for(&root);
-        let result = canonical_secret_checked_target(&request, &root.join("settings.txt"))
+        let result = canonical_secret_checked_target(&root, &root.join("settings.txt"))
             .expect("normal alias should resolve");
         assert_eq!(result, root.join("normal.txt").canonicalize().expect("canonical"));
         let _ = std::fs::remove_dir_all(root);
